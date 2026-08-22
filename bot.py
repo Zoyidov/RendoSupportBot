@@ -3,7 +3,7 @@ import logging
 import os
 import re
 
-import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -25,9 +25,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-# API manzili - kerak bo'lsa Railway'dagi Environment Variables orqali o'zgartirasiz
-API_BASE_URL = os.getenv("API_BASE_URL", "https://rendo-app.rendo.uz/api/v1")
-VERIFY_ENDPOINT = f"{API_BASE_URL}/auth/verify-number"
 # Xabarlar yuboriladigan kanal/guruh ID (bot o'sha yerda admin bo'lishi kerak)
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # masalan: -1001234567890
 
@@ -48,25 +45,19 @@ TEXTS = {
     "uz": {
         "ask_phone": "Telefon raqamingizni yuborish uchun quyidagi tugmani bosing 👇",
         "share_phone_btn": "📱 Raqamni yuborish",
-        "checking": "Raqamingiz tekshirilmoqda, biroz kuting...",
-        "not_found": "Kechirasiz, sizning raqamingiz bizning bazamizda topilmadi.",
-        "found_ask_name": "Raqamingiz tasdiqlandi ✅\n\nIltimos, ismingizni kiriting:",
+        "got_phone": "Rahmat! Endi ismingizni kiriting:",
         "ask_issue": "Rahmat, {name}! Endi qaysi masala bo'yicha yordam kerakligini qisqacha yozib qoldiring:",
         "thanks": "Rahmat! Murojaatingiz qabul qilindi ✅. Tez orada operatorlarimiz siz bilan bog'lanadi.",
         "invalid_phone": "Iltimos, telefon raqamingizni faqat «Raqamni yuborish» tugmasi orqali yuboring.",
-        "error": "Xatolik yuz berdi, birozdan so'ng qayta urinib ko'ring.",
         "restart": "Qaytadan boshlash uchun /start ni bosing.",
     },
     "ru": {
         "ask_phone": "Нажмите на кнопку ниже, чтобы отправить номер телефона 👇",
         "share_phone_btn": "📱 Отправить номер",
-        "checking": "Проверяем ваш номер, подождите немного...",
-        "not_found": "К сожалению, ваш номер не найден в нашей базе.",
-        "found_ask_name": "Ваш номер подтверждён ✅\n\nПожалуйста, введите ваше имя:",
+        "got_phone": "Спасибо! Теперь введите ваше имя:",
         "ask_issue": "Спасибо, {name}! Теперь кратко опишите, по какому вопросу нужна помощь:",
         "thanks": "Спасибо! Ваше обращение принято ✅. Наши операторы скоро свяжутся с вами.",
         "invalid_phone": "Пожалуйста, отправьте номер телефона только с помощью кнопки «Отправить номер».",
-        "error": "Произошла ошибка, попробуйте ещё раз чуть позже.",
         "restart": "Чтобы начать заново, нажмите /start.",
     },
 }
@@ -103,40 +94,6 @@ def normalize_phone(raw: str) -> str:
     return digits
 
 
-async def verify_number(phone: str) -> bool:
-    """
-    Rendo API orqali raqamni bazada bor-yo'qligini tekshiradi.
-
-    MUHIM: haqiqiy API javobining aniq shaklini ko'rib, quyidagi
-    parsing mantig'ini moslashtirish kerak bo'lishi mumkin.
-    Hozirgi holatda bir nechta keng tarqalgan variant qo'llab-quvvatlanadi:
-    {"exists": true}, {"found": true}, {"success": true}, {"result": true} va h.k.
-    """
-    payload = {"phone": phone}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            VERIFY_ENDPOINT, json=payload, timeout=aiohttp.ClientTimeout(total=10)
-        ) as resp:
-            if resp.status == 404:
-                return False
-
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                data = {}
-
-            if resp.status == 200:
-                if isinstance(data, dict):
-                    for key in ("exists", "found", "success", "is_registered", "result"):
-                        if key in data:
-                            return bool(data[key])
-                    # Agar tanish kalit topilmasa, lekin javob bo'sh bo'lmasa - mavjud deb hisoblaymiz
-                    return bool(data)
-                return bool(data)
-
-            return False
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -171,23 +128,8 @@ async def process_phone(message: Message, state: FSMContext):
     phone = normalize_phone(contact.phone_number)
     await state.update_data(phone=phone)
 
-    checking_msg = await message.answer(TEXTS[lang]["checking"], reply_markup=ReplyKeyboardRemove())
-
-    try:
-        exists = await verify_number(phone)
-    except Exception as e:
-        logger.exception("Verify API xatosi: %s", e)
-        await checking_msg.edit_text(TEXTS[lang]["error"])
-        await state.clear()
-        return
-
-    if not exists:
-        await checking_msg.edit_text(TEXTS[lang]["not_found"] + "\n\n" + TEXTS[lang]["restart"])
-        await state.clear()
-        return
-
     await state.set_state(Form.waiting_name)
-    await checking_msg.edit_text(TEXTS[lang]["found_ask_name"])
+    await message.answer(TEXTS[lang]["got_phone"], reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(StateFilter(Form.waiting_phone))
@@ -244,6 +186,27 @@ async def fallback(message: Message):
     await message.answer("Boshlash uchun /start buyrug'ini bosing / Нажмите /start, чтобы начать.")
 
 
+async def health(request):
+    """Render/UptimeRobot uchun oddiy 'tirik' javob beruvchi endpoint."""
+    return web.Response(text="Rendo Support Bot ishlab turibdi ✅")
+
+
+async def start_web_server():
+    """
+    Render 'Web Service' turi portni tinglashni talab qiladi.
+    Bu funksiya shunchaki minimal HTTP server ochib beradi,
+    asosiy ish esa Telegram botning polling jarayonida davom etadi.
+    """
+    port = int(os.getenv("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info("Web server %s portda ishga tushdi (Render health-check uchun).", port)
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment o'zgaruvchisi topilmadi!")
@@ -254,7 +217,12 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Bot ishga tushdi...")
-    await dp.start_polling(bot)
+
+    # Ikkalasi bir vaqtda ishlaydi: Telegram polling va HTTP server
+    await asyncio.gather(
+        dp.start_polling(bot),
+        start_web_server(),
+    )
 
 
 if __name__ == "__main__":
